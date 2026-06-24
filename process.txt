@@ -1,0 +1,216 @@
+Tennis Statistics Database — Data Processing, and loading Documentation
+Andrew Beliwine
+
+
+
+1. DATA SOURCES
+---------------
+All data originates from two open-source GitHub repositories maintained
+by Jeff Sackmann:
+
+  ATP data:
+    URL:    https://github.com/JeffSackmann/tennis_atp
+    Files:  atp_matches_YYYY.csv       (singles match results, per year, 1968–2024)
+            atp_matches_doubles_YYYY.csv (doubles match results, per year)
+            atp_players.csv             (player biographical data, all time)
+            atp_rankings_70s.csv        (weekly rankings, 1970s)
+            atp_rankings_80s.csv        (weekly rankings, 1980s)
+            atp_rankings_90s.csv        (weekly rankings, 1990s)
+            atp_rankings_00s.csv        (weekly rankings, 2000s)
+            atp_rankings_10s.csv        (weekly rankings, 2010s)
+            atp_rankings_20s.csv        (weekly rankings, 2020s)
+            atp_rankings_current.csv    (most recent weeks)
+
+  WTA data:
+    URL:    https://github.com/JeffSackmann/tennis_wta
+    Files founnd:  wta_matches_YYYY.csv       (same structure as ATP)
+            wta_players.csv
+            wta_rankings_*.csv (same   as ATP)
+
+
+
+2. HOW I'M DOWNLOADING
+------------------
+    git clone [repo urls]
+
+
+3. RAW FILE COLUMS FORMAT (singles match CSV columns)
+----------------------------------------------
+tourney_id, tourney_name, surface, draw_size, tourney_level, tourney_date,
+match_num, winner_id, winner_seed, winner_entry, winner_name, winner_hand,
+winner_ht, winner_ioc, winner_age, loser_id, loser_seed, loser_entry,
+loser_name, loser_hand, loser_ht, loser_ioc, loser_age, score, best_of,
+round, minutes, w_ace, w_df, w_svpt, w_1stIn, w_1stWon, w_2ndWon,
+w_SvGms, w_bpSaved, w_bpFaced, l_ace, l_df, l_svpt, l_1stIn, l_1stWon,
+l_2ndWon, l_SvGms, l_bpSaved, l_bpFaced, winner_rank, winner_rank_points,
+loser_rank, loser_rank_points
+
+Key points:
+- tourney_id is formatted as "YYYY-NNNN" (e.g. "2023-540" = Wimbledon 2023).
+  We split this into base tournament code ("540") and year ("2023").
+- Match stats columns (w_ace, w_df, ..., l_bpFaced) are empty (blank) for
+  matches prior to approximately 1991. We map blank to MySQL NULL (\N).
+- winner_hand / loser_hand: 'R', 'L', 'A' (ambidextrous, mapped to 'U').
+- tourney_date is an integer YYYYMMDD; we convert to YYYY-MM-DD.
+- score can contain 'RET', 'W/O', 'DEF' for retirements/walkovers; these
+  are retained as-is in the score column (VARCHAR(60)).
+
+
+4. CLEANING STEPS PERFORMED BY clean_data.py
+--------------------------------------
+a. PLAYER DEDUPLICATION
+   - Load atp_players.csv and wta_players.csv as the primary source of
+     player biographical data.
+   - Supplement with players found in match files but absent from player CSVs
+     (e.g. older players whose records are incomplete).
+   - Deduplicate on player_id. Final key: player_id (Sackmann's integer ID,
+     e.g. "104925" = Rafael Nadal).
+   - IDs for male players in ATP will start with A (prepended to IDs assigned in data), W for women in WTA
+
+b. TOURNAMENT DEDUPLICATION
+   - Extract unique (tourney_id, tourney_name, surface, tourney_level) from
+     all match files (singles + doubles combined).
+   - Strip year prefix from tourney_id to get base code.
+   - Tournaments that changed surface or name over time retain the most
+     recently observed value (last-write-wins in iteration order).
+   - 'location' column is not available in source CSVs; set to NULL.
+     Can be enriched manually using supplementary sources.
+
+c. EDITION EXTRACTION
+   - One row per (base_tourn_id, year) pair.
+   - draw_size copied from match file; prize_money set to NULL (not in CSVs).
+
+d. MATCH ID CONSTRUCTION
+   - match_id = tourney_id + '-' + zero-padded match_num (4 digits).
+     E.g. "2023-520-0001".
+   - Doubles match IDs get a '-d' suffix to prevent collision with singles.
+   - match_id = tour_prefix + full_tourney_id + '-' + zero-padded match_num
+  E.g. "A2023-540-0001" for ATP, "W2023-540-0001" for WTA.
+   - Tour prefix included to prevent ATP/WTA collision on shared tournament codes
+     such as Davis Cup (D001 etc.).
+
+e. MATCH-PLAYER UNPIVOTING
+   - Each source match row contains both winner and loser columns.
+   - We emit TWO rows per match: one with result='W', one with result='L'.
+   - Stat columns (w_ace → aces, w_bpSaved → bp_saved, etc.) mapped to
+     canonical column names. Empty/blank cells → \N (NULL).
+   - num_sets is now pre-computed from score string at ETL time using count_sets()
+  function. Returns NULL for retirements (RET) or walkovers (W/O), and
+  defaults (DEF). Stored as TINYINT in match table to avoid runtime
+  string parsing in SQL queries.
+
+f. DOUBLES TEAM CONSTRUCTION
+   - Each doubles match row contains winner1_id, winner2_id, loser1_id,
+     loser2_id.
+   - We sort each pair (min_id, max_id) to create a canonical team key,
+     preventing (A,B) and (B,A) from being treated as different teams.
+   - team_id is an auto-incrementing integer assigned..
+   - start_date / end_date cannot be reliably determined from match data
+     alone; set to NULL.
+
+g. RANKING DATA
+   - Rankings are in decade-chunked files with columns:
+     rank_date (YYYYMMDD), rank_pos (int), player_id (int), rank_pts (int).
+   - rank_pts is blank/missing for many earlier entries; mapped to NULL.
+   - rank_date converted from YYYYMMDD integer to YYYY-MM-DD string.
+   - Only ranking rows for player_ids that exist in our player table are
+     retained (inner join on player_ids).
+
+h. ANOMALIES ENCOUNTERED
+   - A small number of rows have winner_id == loser_id (data entry errors);
+     these rows are dropped silently.
+   - Some older match files (pre-1980) are missing match_num; these receive
+     a synthetic match_num based on row position within the file.
+   - have no doubles data for WTA as of yet in the repo.
+   - A handful of player records in the match CSVs have player_id = 0 or
+     blank; these are just skipped.
+   - ATP and WTA datasets use overlapping integer player IDs; all IDs are
+  prefixed with 'A' (ATP) or 'W' (WTA) to guarantee uniqueness.
+  - Sackmann placeholder ID 199999 used for unknown/bye players is rejected
+    and mapped to NULL to prevent duplicate PK errors.
+  - Doubles CSV files require index_col=False when read by pandas — without
+    this, tourney_id is incorrectly treated as the row index, shifting all
+    columns one position left and putting player names in the round column.
+  - Old-format match IDs without a year prefix (e.g. "Auckland" instead of
+    "1997-Auckland") are handled via try/except in make_match_id, falling
+    back to the raw string value.
+  - WTA ranking files have a different format from ATP — they include a
+    header row with columns named ranking_date, rank, player, points, tours
+    instead of the ATP headerless format. Detected by checking whether the
+    first character of the file is a digit.
+  - Duplicate (match_id, team_id) pairs in team_match caused by misaligned
+    columns are removed via drop_duplicates. Each match is further capped
+    at 2 team rows (one W, one L) using groupby().head(2).
+  - Overlapping decade ranking files (e.g. atp_rankings_10s.csv and
+    atp_rankings_current.csv share rows) deduplicated on (player_id, rank_date)
+    keeping first occurrence.
+
+
+5. OUTPUT FILES (in ./clean_data/)
+------------------------------
+  players.csv       — tab-separated, no header, columns as in setup.sql player table
+  tournaments.csv   — tab-separated, no header
+  editions.csv      — tab-separated, no header
+  matches.csv       — tab-separated, no header (singles + doubles combined)
+  match_player.csv  — tab-separated, no header
+  doubles_teams.csv — tab-separated, no header
+  team_matches.csv  — tab-separated, no header
+  rankings.csv      — tab-separated, no header
+
+  NULL values represented as \N (MySQL LOAD DATA INFILE default).
+
+
+6. HOW TO RUN
+-------------
+  # Install dependencies
+  pip install pandas
+
+  # Run clean_data.py for years 1968-2024
+  python clean_data.py --atp ./tennis_atp --wta ./tennis_wta --out ./clean_data --years 1968 2024
+
+  # Then in MySQL
+  source setup.sql
+  source load.sql    
+
+
+
+
+  
+
+  7. DATA AVAILABILITY CAVEATS
+-----------------------------
+The following fields are defined in the schema but are starting to appear limited or no
+coverage in the Sackmann CSV source data -- will look for substitute later:
+
+  location (tournament):
+    Not present in any match CSV. Would require manual entry or scraping
+    from a supplementary source (e.g. Wikipedia, ATP/WTA websites). Left NULL.
+
+  prize_money (edition):
+    Sporadically present in newer match files but absent from most
+    historical data. Not reliably extractable; left NULL.
+
+  start_date / end_date (doubles_team):
+    Cannot be reliably derived from match data. The first and last match
+    dates for a team pair could serve as a proxy but would be inaccurate
+    for teams with gaps. Left NULL.
+
+  rank_pts (ranking):
+    NULL for most pre-1985 ATP entries. WTA points coverage is also
+    inconsistent due to multiple system changes over the decades.
+    rank_pos is reliable across all years; rank_pts should be treated
+    as best-effort.
+
+  dbl_ranking:
+    The Sackmann repositories do not include dedicated doubles ranking
+    files in the same format as singles rankings. The dbl_ranking table
+    will be empty unless a supplementary source is identified.
+    Verified by inspecting repo contents after cloning.
+
+  birthdate / height_cm (player):
+    Present in atp_players.csv and wta_players.csv but frequently blank
+    for older or lower-ranked players. Loaded as NULL where missing.
+
+  seed (match_player):
+    Only populated for seeded players (typically top 32 in a draw).
+    All unseeded players will have NULL in this column.
